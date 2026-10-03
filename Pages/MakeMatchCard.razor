@@ -162,6 +162,16 @@
         public bool IsCanceled { get; set; } = false;
     }
 
+    // ========================================
+    // 1ラウンド分の仮の試合
+    // ========================================
+    private class RoundMatchCandidate
+    {
+        public List<Player> Participants { get; set; } = new();
+
+        public List<string> Pairs { get; set; } = new();
+    }
+
     // 画面で使う変数たち
     private List<Player> players = new List<Player>();
     private List<MatchResultItem> matchResults = new List<MatchResultItem>();
@@ -341,20 +351,34 @@
     {
 
         int requiredPlayersPerCourt = matchType == "doubles" ? 4 : 2;
-        var activePool = players.Where(p => p.Status == "active").ToList();
+
+        var activePool = players
+            .Where(p => p.Status == "active")
+            .ToList();
+
         int totalRequiredPlayers = courtCount * requiredPlayersPerCourt;
 
         if (activePool.Count < totalRequiredPlayers)
         {
-            await JSRuntime.InvokeVoidAsync("alert", $"参加中のプレイヤーが足りません。最低 {totalRequiredPlayers} 人必要です。(現在参加中: {activePool.Count}人)");
+            await JSRuntime.InvokeVoidAsync(
+                "alert",
+                $"参加中のプレイヤーが足りません。最低 {totalRequiredPlayers} 人必要です。(現在参加中: {activePool.Count}人)"
+            );
+
             return;
         }
 
+
         // ✅【ココが重要】ループに入る「前」に、全プレイヤーの現在の試合数を完全バックアップ
-        matchCountBackup = players.Select(p => p.MatchCount).ToList();
-        lastSelectedPlayers = new List<Player>(activePool); // Undo実行判定フラグを兼ねる
+        matchCountBackup = players
+         .Select(p => p.MatchCount)
+         .ToList();
+
+        lastSelectedPlayers = new List<Player>(activePool);
+
         matchResults.Clear();
-        // 10回・5回・1回のループ回数設定
+        restingMembersText = "";
+
         int loopCount = generationMode switch
         {
             "ten" => 10,
@@ -363,79 +387,472 @@
         };
 
         // 連続生成中に「試合数が少ない人」を正しく選出するための仮想カウント辞書
-        var virtualMatchCounts = activePool.ToDictionary(p => p.Name, p => p.MatchCount);
+        var virtualMatchCounts = activePool
+       .ToDictionary(
+           p => p.Name,
+           p => p.MatchCount
+       );
+
+        var previousPlayed = activePool
+         .ToDictionary(
+             p => p.Name,
+             p => false
+         );
+
+        // ----------------------------------------
+        // 今回の生成中に組んだペア
+        //
+        // "A|B" と "B|A" を同じものとして扱う
+        // ----------------------------------------
+        var usedPairs = new HashSet<string>();
+
+        // ----------------------------------------
+        // 10試合の間、一度も選ばれなかった人
+        // ----------------------------------------
         var allSelectedInSession = new HashSet<string>();
 
-        for (int r = 1; r <= loopCount; r++)
+        // ----------------------------------------
+        // ラウンドごとに生成
+        // ----------------------------------------
+        for (int round = 1; round <= loopCount; round++)
         {
-            // 仮想カウントが少ない順に選出（実際のMatchCountは変更しない）
-            var selectedPlayers = activePool
-                .OrderBy(p => virtualMatchCounts[p.Name])
-                .ThenBy(_ => rand.Next())
-                .Take(totalRequiredPlayers)
-                .ToList();
+            var bestRound = FindBestRound(
+                activePool,
+                virtualMatchCounts,
+                previousPlayed,
+                usedPairs,
+                totalRequiredPlayers,
+                requiredPlayersPerCourt
+            );
 
-            foreach (var p in selectedPlayers)
+            // 万が一、組み合わせを作れなかった場合
+            if (bestRound == null)
             {
-                allSelectedInSession.Add(p.Name);
-                // 仮想カウントのみ増やして次のループの選出基準にする
-                virtualMatchCounts[p.Name]++;
+                await JSRuntime.InvokeVoidAsync(
+                    "alert",
+                    $"第{round}試合の組み合わせを作成できませんでした。\n" +
+                    "参加人数・コート数を確認してください。"
+                );
+
+                break;
             }
 
-            var shuffledSelected = selectedPlayers.OrderBy(_ => rand.Next()).ToList();
-            int playerIdx = 0;
-            int actualCourts = Math.Min(courtCount, shuffledSelected.Count / requiredPlayersPerCourt);
+            // ----------------------------------------
+            // 選ばれた人
+            // ----------------------------------------
+            var selectedNames = bestRound
+                .SelectMany(m => m.Participants)
+                .Select(p => p.Name)
+                .ToHashSet();
 
-            for (int i = 0; i < actualCourts; i++)
+            foreach (var name in selectedNames)
             {
+                allSelectedInSession.Add(name);
+
+                // 仮想試合数を増やす
+                virtualMatchCounts[name]++;
+            }
+
+            // ----------------------------------------
+            // 今ラウンドの出場状態を記録
+            // ----------------------------------------
+            var currentPlayed = activePool
+                .ToDictionary(
+                    p => p.Name,
+                    p => selectedNames.Contains(p.Name)
+                );
+
+            // ----------------------------------------
+            // 試合カードを作成
+            // ----------------------------------------
+            for (int court = 0; court < bestRound.Count; court++)
+            {
+                var roundMatch = bestRound[court];
+
                 var item = new MatchResultItem();
 
-                // 複数回生成モードの場合、各ラウンドの第1コートに見出しを付与
-                if (loopCount > 1 && i == 0)
+                // 10試合モードの場合だけ
+                // 第1コートにラウンド名を表示
+                if (loopCount > 1 && court == 0)
                 {
-                    item.RoundName = $"第 {r} 試合";
+                    item.RoundName = $"第 {round} 試合";
                 }
 
-                item.CourtName = $"コート {i + 1}";
-                string amp = "<small style='color: #888888;'> & </small>";
-                string vs = "<small style='color: #888888;'>vs</small>";
+                item.CourtName = $"コート {court + 1}";
+
+                string amp =
+                    "<small style='color: #888888;'> & </small>";
+
+                string vs =
+                    "<small style='color: #888888;'>vs</small>";
 
                 if (matchType == "doubles")
                 {
-                    var p1 = shuffledSelected[playerIdx++];
-                    var p2 = shuffledSelected[playerIdx++];
-                    var p3 = shuffledSelected[playerIdx++];
-                    var p4 = shuffledSelected[playerIdx++];
+                    var p1 = roundMatch.Participants[0];
+                    var p2 = roundMatch.Participants[1];
+                    var p3 = roundMatch.Participants[2];
+                    var p4 = roundMatch.Participants[3];
 
-                    item.ParticipantNames = new List<string> { p1.Name, p2.Name, p3.Name, p4.Name };
-                    item.MatchText = $"{p1.Name}{amp}{p2.Name} {vs} {p3.Name}{amp}{p4.Name}";
+                    item.ParticipantNames = new List<string>
+                {
+                    p1.Name,
+                    p2.Name,
+                    p3.Name,
+                    p4.Name
+                };
+
+                    item.MatchText =
+                        $"{p1.Name}{amp}{p2.Name} {vs} {p3.Name}{amp}{p4.Name}";
                 }
                 else
                 {
-                    var p1 = shuffledSelected[playerIdx++];
-                    var p2 = shuffledSelected[playerIdx++];
+                    var p1 = roundMatch.Participants[0];
+                    var p2 = roundMatch.Participants[1];
 
-                    item.ParticipantNames = new List<string> { p1.Name, p2.Name };
-                    item.MatchText = $"{p1.Name} {vs} {p2.Name}";
+                    item.ParticipantNames = new List<string>
+                {
+                    p1.Name,
+                    p2.Name
+                };
+
+                    item.MatchText =
+                        $"{p1.Name} {vs} {p2.Name}";
                 }
 
-                // ⚠️ ここでは p.MatchCount++ を行わない！
                 matchResults.Add(item);
+
+                // ペアを登録
+                foreach (var pair in roundMatch.Pairs)
+                {
+                    usedPairs.Add(pair);
+                }
             }
+
+            // ----------------------------------------
+            // 次ラウンド用に状態を更新
+            // ----------------------------------------
+            previousPlayed = currentPlayed;
         }
 
-        // お休みメンバーの抽出
+        // ----------------------------------------
+        // 一度も呼ばれなかった人
+        // ----------------------------------------
         var restingInActivePool = activePool
             .Where(p => !allSelectedInSession.Contains(p.Name))
             .Select(p => p.Name)
             .ToList();
 
-        restingMembersText = restingInActivePool.Count > 0
-            ? string.Join(", ", restingInActivePool)
-            : "";
+        restingMembersText =
+            restingInActivePool.Count > 0
+                ? string.Join(", ", restingInActivePool)
+                : "";
 
         await SaveData();
     }
+
+    //ペアを判定するメゾット
+    private string GetPairKey(string player1, string player2)
+    {
+        if (string.Compare(
+                player1,
+                player2,
+                StringComparison.Ordinal) < 0)
+        {
+            return $"{player1}|{player2}";
+        }
+
+        return $"{player2}|{player1}";
+    }
+    // ========================================
+    // 1ラウンドの最適な組み合わせを探す
+    // ========================================
+    private List<RoundMatchCandidate>? FindBestRound(
+        List<Player> activePool,
+        Dictionary<string, int> virtualMatchCounts,
+        Dictionary<string, bool> previousPlayed,
+        HashSet<string> usedPairs,
+        int totalRequiredPlayers,
+        int requiredPlayersPerCourt)
+    {
+        List<RoundMatchCandidate>? bestRound = null;
+
+        double bestScore = double.MaxValue;
+
+        // 何通りか試して、一番バランスの良いものを採用
+        const int attempts = 500;
+
+        for (int attempt = 0; attempt < attempts; attempt++)
+        {
+            // ----------------------------------------
+            // 試合数が少ない人を中心に候補を作る
+            // ----------------------------------------
+            var shuffled = activePool
+                .OrderBy(p => virtualMatchCounts[p.Name])
+                .ThenBy(_ => rand.Next())
+                .ToList();
+
+            // ----------------------------------------
+            // 上位から少し幅を持たせて選ぶ
+            // ----------------------------------------
+            int poolSize = Math.Min(
+                shuffled.Count,
+                Math.Max(
+                    totalRequiredPlayers + 4,
+                    totalRequiredPlayers
+                )
+            );
+
+            var candidatePool = shuffled
+                .Take(poolSize)
+                .OrderBy(_ => rand.Next())
+                .ToList();
+
+            // ----------------------------------------
+            // 実際に試合を作る
+            // ----------------------------------------
+            var result = new List<RoundMatchCandidate>();
+
+            var usedPlayers = new HashSet<string>();
+
+            bool failed = false;
+
+            for (
+                int court = 0;
+                court < courtCount;
+                court++)
+            {
+                var available = candidatePool
+                    .Where(p => !usedPlayers.Contains(p.Name))
+                    .OrderBy(_ => rand.Next())
+                    .ToList();
+
+                if (available.Count < requiredPlayersPerCourt)
+                {
+                    failed = true;
+                    break;
+                }
+
+                RoundMatchCandidate? selectedMatch = null;
+
+                // このコートについて何通りか試す
+                for (int x = 0; x < 100; x++)
+                {
+                    var group = available
+                        .OrderBy(_ => rand.Next())
+                        .Take(requiredPlayersPerCourt)
+                        .ToList();
+
+                    if (group.Count != requiredPlayersPerCourt)
+                        continue;
+
+                    if (matchType == "doubles")
+                    {
+                        var p1 = group[0];
+                        var p2 = group[1];
+                        var p3 = group[2];
+                        var p4 = group[3];
+
+                        var pair1 = GetPairKey(
+                            p1.Name,
+                            p2.Name);
+
+                        var pair2 = GetPairKey(
+                            p3.Name,
+                            p4.Name);
+
+                        // すでに使ったペアならNG
+                        if (usedPairs.Contains(pair1) ||
+                            usedPairs.Contains(pair2))
+                        {
+                            continue;
+                        }
+
+                        // 同じペア同士になってしまう場合
+                        if (pair1 == pair2)
+                            continue;
+
+                        selectedMatch = new RoundMatchCandidate
+                        {
+                            Participants = group,
+                            Pairs = new List<string>
+                        {
+                            pair1,
+                            pair2
+                        }
+                        };
+
+                        break;
+                    }
+                    else
+                    {
+                        var p1 = group[0];
+                        var p2 = group[1];
+
+                        var pair = GetPairKey(
+                            p1.Name,
+                            p2.Name);
+
+                        // シングルスでも同じ対戦を避ける
+                        if (usedPairs.Contains(pair))
+                            continue;
+
+                        selectedMatch = new RoundMatchCandidate
+                        {
+                            Participants = group,
+                            Pairs = new List<string>
+                        {
+                            pair
+                        }
+                        };
+
+                        break;
+                    }
+                }
+
+                if (selectedMatch == null)
+                {
+                    failed = true;
+                    break;
+                }
+
+                result.Add(selectedMatch);
+
+                foreach (var player in selectedMatch.Participants)
+                {
+                    usedPlayers.Add(player.Name);
+                }
+            }
+
+            if (failed)
+                continue;
+
+            // ----------------------------------------
+            // このラウンドの評価
+            // ----------------------------------------
+            double score = CalculateRoundScore(
+                result,
+                activePool,
+                virtualMatchCounts,
+                previousPlayed
+            );
+
+            if (score < bestScore)
+            {
+                bestScore = score;
+                bestRound = result;
+            }
+        }
+
+        return bestRound;
+    }
+
+    // ========================================
+    // ラウンドのバランスを評価
+    //
+    // 点数が低いほど良い
+    // ========================================
+    private double CalculateRoundScore(
+        List<RoundMatchCandidate> round,
+        List<Player> activePool,
+        Dictionary<string, int> virtualMatchCounts,
+        Dictionary<string, bool> previousPlayed)
+    {
+        var currentPlayed =
+            round
+                .SelectMany(x => x.Participants)
+                .Select(x => x.Name)
+                .ToHashSet();
+
+        double score = 0;
+
+        // ========================================
+        // ① 試合数の偏り
+        // ========================================
+
+        var counts = activePool
+            .Select(p =>
+            {
+                int count = virtualMatchCounts[p.Name];
+
+                if (currentPlayed.Contains(p.Name))
+                    count++;
+
+                return count;
+            })
+            .ToList();
+
+        int maxCount = counts.Max();
+        int minCount = counts.Min();
+
+        // 最大と最小の差を小さくする
+        score += (maxCount - minCount) * 100;
+
+
+        // ========================================
+        // ② 連続出場を減らす
+        // ========================================
+
+        foreach (var player in activePool)
+        {
+            bool nowPlaying =
+                currentPlayed.Contains(player.Name);
+
+            bool playedLast =
+                previousPlayed[player.Name];
+
+            if (nowPlaying && playedLast)
+            {
+                // 連続出場
+                score += 25;
+            }
+        }
+
+
+        // ========================================
+        // ③ 連続休憩を減らす
+        // ========================================
+
+        foreach (var player in activePool)
+        {
+            bool nowPlaying =
+                currentPlayed.Contains(player.Name);
+
+            bool playedLast =
+                previousPlayed[player.Name];
+
+            bool restingNow = !nowPlaying;
+            bool restingLast = !playedLast;
+
+            if (restingNow && restingLast)
+            {
+                // 連続休憩
+                score += 80;
+            }
+        }
+
+
+        // ========================================
+        // ④ 休憩→出場を少し優先
+        // ========================================
+
+        foreach (var player in activePool)
+        {
+            bool nowPlaying =
+                currentPlayed.Contains(player.Name);
+
+            bool playedLast =
+                previousPlayed[player.Name];
+
+            if (nowPlaying && !playedLast)
+            {
+                // 前回休み → 今回出場
+                score -= 15;
+            }
+        }
+
+        return score;
+    }
+
     private async Task CompleteMatches()
     {
         if (!matchResults.Any()) return;
