@@ -6,6 +6,7 @@
 
 <div class="container mt-4">
     <h3 class="mb-4">出欠表</h3>
+    <h6 class="mb-4">メンバーの名前と練習時間を入力したら表が現れます。<br />名前と時間がクロスする部分をタップして参加か不参加を入力し、コート代なの度金額を入力してください。<br />最後に会計ボタンを押すと参加時間に応じた金額の表が現れます</h6>
 
     <!-- 設定エリア -->
     <div class="row mb-4 bg-light p-3 rounded shadow-sm">
@@ -70,7 +71,7 @@
                         <td>
                             <button class="btn @(GetAttendanceStatus(member, slot) ? "btn-success" : "btn-secondary") w-100"
                                     @onclick="() => ToggleAttendance(member, slot)">
-                                @(GetAttendanceStatus(member, slot) ? "参加" : "ー")
+                                @(GetAttendanceStatus(member, slot) ? "参加" : "×")
                             </button>
                         </td>
                     }
